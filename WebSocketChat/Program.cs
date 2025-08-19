@@ -1,81 +1,98 @@
-using System.Net; 
-using System.Net.WebSockets; 
-using System.Text; 
-using System.Collections.Concurrent; 
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Collections.Concurrent;
+using System.Text.Json;
 
-var builder = WebApplication.CreateBuilder(args); // Cria um construtor para a aplicação
+int port = 5124;
+var listener = new TcpListener(IPAddress.Any, port);
+listener.Start();
+Console.WriteLine($"[SERVIDOR] Ouvindo em 0.0.0.0:{port} (TCP)\n");
 
-var app = builder.Build(); // Constrói a aplicação
+var clients = new ConcurrentDictionary<TcpClient, NetworkStream>();
 
-app.UseWebSockets(); // Habilita o suporte a WebSockets
-
-// Cria um dicionário concorrente para gerenciar os clientes conectados
-var clients = new ConcurrentDictionary<WebSocket, WebSocket>();
-
-// Mapeia a rota raiz "/" para o tratamento de requisições
-app.MapGet("/", async context =>
+_ = Task.Run(async () =>
 {
-    // Verifica se a requisição é do tipo WebSocket
-    if (!context.WebSockets.IsWebSocketRequest)
+    while (true)
     {
-        // Se não for uma requisição WebSocket, responde com status 400 Bad Request
-        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-        return;
-    }
+        var tcp = await listener.AcceptTcpClientAsync();
+        var stream = tcp.GetStream();
+        clients[tcp] = stream;
+        Console.WriteLine($"[+] Cliente conectado de {tcp.Client.RemoteEndPoint}");
 
-    // Aceita a requisição WebSocket e obtém o objeto WebSocket
-    var webSocket = await context.WebSockets.AcceptWebSocketAsync();
-    // Adiciona o WebSocket ao dicionário de clientes
-    clients.TryAdd(webSocket, webSocket);
-    Console.WriteLine("Usuario Conectado");
-
-    // Cria um buffer para receber mensagens
-    var buffer = new byte[1024 * 4];
-    try
-    {
-        // Loop para manter a conexão aberta enquanto o estado do WebSocket for Open
-        while (webSocket.State == WebSocketState.Open)
+        _ = Task.Run(async () =>
         {
-            // Recebe uma mensagem do cliente
-            var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
-            if (result.MessageType == WebSocketMessageType.Close)
+            try
             {
-                // Se a mensagem for de fechamento, fecha o WebSocket
-                await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
-            }
-            else
-            {
-                // Converte o buffer recebido em uma string
-                var message = Encoding.ASCII.GetString(buffer, 0, result.Count);
-                Console.WriteLine($"Mensagem recebida de: {message}");
-
-                // Prepara a mensagem para ser enviada aos outros clientes
-                var data = Encoding.ASCII.GetBytes(message);
-                foreach (var client in clients.Keys)
+                while (tcp.Connected)
                 {
-                    // Envia a mensagem para todos os clientes exceto o remetente original
-                    if (client != webSocket && client.State == WebSocketState.Open)
+                    string? json = await ReadFramedAsync(stream);
+                    if (json == null) break;
+
+                    var msg = JsonSerializer.Deserialize<ChatMessage>(json);
+                    if (msg == null) continue;
+
+                    foreach (var kv in clients)
                     {
-                        await client.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, CancellationToken.None);
+                        if (kv.Key == tcp) continue;
+                        try { await WriteFramedAsync(kv.Value, json); }
+                        catch { /* ignora cliente com erro */ }
                     }
                 }
             }
-        }
-    }
-    catch (WebSocketException e)
-    {
-        // Trata erros de WebSocket
-        Console.WriteLine($"WebSocket erro: {e.Message}");
-    }
-    finally
-    {
-        // Remove o WebSocket do dicionário de clientes e fecha a conexão
-        clients.TryRemove(webSocket, out _);
-        await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
-        webSocket.Dispose();
-        Console.WriteLine("Usuario saiu");
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERRO CLIENTE] {ex.Message}");
+            }
+            finally
+            {
+                clients.TryRemove(tcp, out _);
+                try { tcp.Close(); } catch { }
+                Console.WriteLine("[-] Cliente desconectado");
+            }
+        });
     }
 });
 
-// Configura o servidor para escutar em todas as interfaces de rede (0.0.0.0) na porta 5124
-await app.RunAsync("http://0.0.0.0:5124");
+Console.WriteLine("Pressione ENTER para encerrar o servidor...");
+Console.ReadLine();
+listener.Stop();
+    
+static async Task<string?> ReadFramedAsync(NetworkStream stream)
+{
+    byte[] lenBuf = new byte[4];
+    int read = await ReadExactAsync(stream, lenBuf, 0, 4);
+    if (read == 0) return null;
+    if (read < 4) throw new IOException("Frame incompleto");
+    if (BitConverter.IsLittleEndian) Array.Reverse(lenBuf);
+    int len = BitConverter.ToInt32(lenBuf, 0);
+    if (len <= 0 || len > 10_000_000) throw new IOException("Tamanho inválido");
+    byte[] data = new byte[len];
+    read = await ReadExactAsync(stream, data, 0, len);
+    if (read < len) throw new IOException("Payload incompleto");
+    return Encoding.UTF8.GetString(data);
+}
+
+static async Task<int> ReadExactAsync(NetworkStream s, byte[] buf, int off, int count)
+{
+    int total = 0;
+    while (total < count)
+    {
+        int r = await s.ReadAsync(buf, off + total, count - total);
+        if (r == 0) break;
+        total += r;
+    }
+    return total;
+}
+
+static async Task WriteFramedAsync(NetworkStream stream, string json)
+{
+    byte[] data = Encoding.UTF8.GetBytes(json);
+    byte[] len = BitConverter.GetBytes(data.Length);
+    if (BitConverter.IsLittleEndian) Array.Reverse(len);
+    await stream.WriteAsync(len, 0, 4);
+    await stream.WriteAsync(data, 0, data.Length);
+    await stream.FlushAsync();
+}
+
+public record ChatMessage(string Cipher, string Sender, string Payload);
