@@ -30,7 +30,25 @@ _ = Task.Run(async () =>
                     if (json == null) break;
 
                     var msg = JsonSerializer.Deserialize<ChatMessage>(json);
-                    if (msg == null) continue;
+                    if (msg != null)
+                    {
+                        if (string.Equals(msg.Cipher, "rc4", StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                var bytes = ParseCsvBytes(msg.Payload);
+                                Console.WriteLine($"[RC4 DECIMAL] {msg.Sender}: {string.Join(",", bytes)}");
+                            }
+                            catch
+                            {
+                                Console.WriteLine($"[RC4 DECIMAL] {msg.Sender}: (payload inválido) {msg.Payload}");
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[{msg.Cipher}] {msg.Sender}: {msg.Payload}");
+                        }
+                    }
 
                     foreach (var kv in clients)
                     {
@@ -94,5 +112,19 @@ static async Task WriteFramedAsync(NetworkStream stream, string json)
     await stream.WriteAsync(data, 0, data.Length);
     await stream.FlushAsync();
 }
+
+static byte[] ParseCsvBytes(string s)
+{
+    var parts = s.Split(new[] { ',', ' ', ';', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+    var list = new List<byte>(parts.Length);
+    foreach (var p in parts)
+    {
+        if (!byte.TryParse(p, out var b))
+            throw new FormatException("Valor RC4 inválido (não é byte 0..255).");
+        list.Add(b);
+    }
+    return list.ToArray();
+}
+
 
 public record ChatMessage(string Cipher, string Sender, string Payload);
